@@ -312,8 +312,7 @@ static void ring_buffer_push(const char *message)
 {
     pthread_mutex_lock(&g_ring_buffer.ring_mutex);
 
-    strncpy(g_ring_buffer.entries[g_ring_buffer.head], message, MAX_LOG_LINE - 1);
-    g_ring_buffer.entries[g_ring_buffer.head][MAX_LOG_LINE - 1] = '\0';
+    snprintf(g_ring_buffer.entries[g_ring_buffer.head], MAX_LOG_LINE, "%s", message);
 
     g_ring_buffer.head = (g_ring_buffer.head + 1) % RING_BUFFER_SIZE;
     if (g_ring_buffer.count < RING_BUFFER_SIZE) {
@@ -350,6 +349,9 @@ static void ring_buffer_push(const char *message)
  */
 int log_init(void)
 {
+    const char *failed_log_file = NULL;
+    int failed_log_errno = 0;
+
     pthread_mutex_lock(&log_mutex);
 
     /* Cache PID */
@@ -379,8 +381,8 @@ int log_init(void)
     if (env_log_file != NULL && strlen(env_log_file) > 0) {
         g_log_file = fopen(env_log_file, "a");
         if (g_log_file == NULL) {
-            fprintf(stderr, "Failed to open log file '%s': %s\n",
-                    env_log_file, strerror(errno));
+            failed_log_file = env_log_file;
+            failed_log_errno = errno;
             /* Fall back to stderr */
             g_log_file = stderr;
         }
@@ -405,6 +407,11 @@ int log_init(void)
     }
 
     pthread_mutex_unlock(&log_mutex);
+
+    if (failed_log_file != NULL) {
+        LOG_ERROR("Failed to open log file '%s': %s",
+                  failed_log_file, strerror(failed_log_errno));
+    }
 
     LOG_INFO("Legacy logging subsystem initialized (level=%d, module=%s)", g_log_level, g_module_name);
 
@@ -548,6 +555,8 @@ void log_message(int level, const char *file, int line, const char *fmt, ...)
  */
 void log_shutdown(void)
 {
+    LOG_INFO("Legacy logging subsystem shut down.");
+
     pthread_mutex_lock(&log_mutex);
 
     if (g_log_file != NULL && g_log_file != stderr) {
@@ -559,8 +568,6 @@ void log_shutdown(void)
     g_log_level = LOG_LEVEL_NONE;
 
     pthread_mutex_unlock(&log_mutex);
-
-    fprintf(stderr, "Legacy logging subsystem shut down.\n");
 }
 
 /**
@@ -576,29 +583,38 @@ int log_dump_ring_buffer(int fd)
     if (fd < 0) {
         return -1;
     }
+    (void)fd; /* Dumps are now routed through the logger macros. */
 
     pthread_mutex_lock(&g_ring_buffer.ring_mutex);
 
     int count = g_ring_buffer.count;
     int idx = g_ring_buffer.tail;
+    char (*entries)[MAX_LOG_LINE] = NULL;
 
-    char ring_buf[65536];
-    int written = 0;
-    written += snprintf(ring_buf + written, sizeof(ring_buf) - written,
-        "=== RING BUFFER DUMP (%d entries) ===\n", count);
+    if (count > 0) {
+        entries = calloc((size_t)count, sizeof(*entries));
+        if (entries == NULL) {
+            pthread_mutex_unlock(&g_ring_buffer.ring_mutex);
+            LOG_ERROR("Failed to allocate ring buffer dump copy for %d entries", count);
+            return -1;
+        }
 
-    for (int i = 0; i < count && written < (int)sizeof(ring_buf) - 256; i++) {
-        written += snprintf(ring_buf + written, sizeof(ring_buf) - written,
-            "%s\n", g_ring_buffer.entries[idx]);
-        idx = (idx + 1) % RING_BUFFER_SIZE;
+        for (int i = 0; i < count; i++) {
+            strncpy(entries[i], g_ring_buffer.entries[idx], MAX_LOG_LINE - 1);
+            entries[i][MAX_LOG_LINE - 1] = '\0';
+            idx = (idx + 1) % RING_BUFFER_SIZE;
+        }
     }
 
-    written += snprintf(ring_buf + written, sizeof(ring_buf) - written,
-        "=== END RING BUFFER DUMP ===\n");
-    ssize_t _written = write(fd, ring_buf, written);
-    (void)_written;  // suppress unused-result warning. the ring buffer dump is best-effort.
-
     pthread_mutex_unlock(&g_ring_buffer.ring_mutex);
+
+    LOG_INFO("=== RING BUFFER DUMP (%d entries) ===", count);
+    for (int i = 0; i < count; i++) {
+        LOG_INFO("%s", entries[i]);
+    }
+    LOG_INFO("=== END RING BUFFER DUMP ===");
+
+    free(entries);
     return count;
 }
 
